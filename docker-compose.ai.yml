@@ -1,0 +1,11 @@
+services:
+  compudia-background-ai:
+    build:
+      context: ./ai-background-service
+    environment:
+      REMBG_MODEL: u2net
+      REMBG_ALPHA_MATTING: "false"
+      MAX_IMAGE_BYTES: 20971520
+    ports:
+      - "8010:8010"
+    restart: unless-stopped
