@@ -16,6 +16,9 @@ Route::get('/remove-background', function () {
 Route::post('/remove-background/rembg', [BackgroundRemovalController::class, 'rembg'])
     ->name('remove-background.rembg');
 
+Route::post('/remove-background/training-example', [BackgroundRemovalController::class, 'trainingExample'])
+    ->name('remove-background.training-example');
+
 Route::get('/contact', function () {
     return Inertia::render('Contact');
 })->name('contact');

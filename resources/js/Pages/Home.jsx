@@ -408,6 +408,24 @@ async function blobToImageData(blob, targetWidth, targetHeight) {
     }
 }
 
+function canvasToBlob(canvas, type = 'image/png', quality) {
+    return new Promise((resolve, reject) => {
+        canvas.toBlob((blob) => {
+            if (blob) {
+                resolve(blob);
+            } else {
+                reject(new Error('Could not prepare training image.'));
+            }
+        }, type, quality);
+    });
+}
+
+async function imageDataToPngBlob(imageData) {
+    const canvas = createCanvas(imageData.width, imageData.height);
+    canvas.getContext('2d').putImageData(imageData, 0, 0);
+    return canvasToBlob(canvas, 'image/png');
+}
+
 function getCsrfToken() {
     return document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') || '';
 }
@@ -430,6 +448,50 @@ async function requestRembgBackgroundRemoval(imageFile) {
     }
 
     return response.blob();
+}
+
+async function submitTrainingExample({
+    originalBlob,
+    originalName,
+    initialMask,
+    correctedMask,
+    keepCorrections,
+    removeCorrections,
+    source,
+    metadata,
+}) {
+    if (!originalBlob || !initialMask || !correctedMask) return null;
+
+    const formData = new FormData();
+    formData.append('original', originalBlob, originalName || 'original.png');
+    formData.append('initial_mask', await imageDataToPngBlob(initialMask), 'initial-mask.png');
+    formData.append('corrected_mask', await imageDataToPngBlob(correctedMask), 'corrected-mask.png');
+
+    if (keepCorrections) {
+        formData.append('keep_corrections', await imageDataToPngBlob(keepCorrections), 'keep-corrections.png');
+    }
+
+    if (removeCorrections) {
+        formData.append('remove_corrections', await imageDataToPngBlob(removeCorrections), 'remove-corrections.png');
+    }
+
+    formData.append('source', source || 'auto-detect');
+    formData.append('metadata', JSON.stringify(metadata || {}));
+
+    const response = await fetch('/remove-background/training-example', {
+        method: 'POST',
+        body: formData,
+        headers: {
+            Accept: 'application/json',
+            'X-CSRF-TOKEN': getCsrfToken(),
+        },
+    });
+
+    if (!response.ok) {
+        throw new Error(`Training example save failed with status ${response.status}`);
+    }
+
+    return response.json();
 }
 
 function normalizeMask(imageData) {
@@ -455,6 +517,36 @@ function normalizeMask(imageData) {
         normalized.data[i + 3] = value;
     }
     return normalized;
+}
+
+function mergeMasksForResultRefinement(currentMask, detectedMask) {
+    const current = normalizeMask(currentMask);
+    const detected = normalizeMask(detectedMask);
+    const refined = cloneImageData(current);
+
+    for (let i = 0; i < refined.data.length; i += 4) {
+        refined.data[i] = 255;
+        refined.data[i + 1] = 255;
+        refined.data[i + 2] = 255;
+        refined.data[i + 3] = Math.min(current.data[i + 3], detected.data[i + 3]);
+    }
+
+    return refined;
+}
+
+function applyManualCorrectionMemory(maskData, keepCorrections, removeCorrections) {
+    const corrected = cloneImageData(maskData);
+
+    for (let i = 0; i < corrected.data.length; i += 4) {
+        if (keepCorrections?.data[i + 3] > 80) {
+            corrected.data[i + 3] = 255;
+        }
+        if (removeCorrections?.data[i + 3] > 80) {
+            corrected.data[i + 3] = 0;
+        }
+    }
+
+    return corrected;
 }
 
 function sharpenMaskEdges(maskData) {
@@ -1489,6 +1581,7 @@ function SelectionPanel({
     onAutoDetect,
     onRestoreSelection,
     onRemoveBackground,
+    onStartOver,
     isDetecting,
     hasMask,
     backgroundRemoved,
@@ -1562,7 +1655,7 @@ function SelectionPanel({
             )}
 
             <button className="soft-action" type="button" onClick={() => onAutoDetect?.()} disabled={isDetecting || !onAutoDetect}>
-                <TbWand /> {isDetecting ? 'Detecting...' : 'Auto Detect'}
+                <TbWand /> {isDetecting ? 'Detecting...' : backgroundRemoved ? 'Refine Auto' : 'Auto Detect'}
             </button>
 
             <button className="soft-action" type="button" onClick={() => onRestoreSelection?.()} disabled={!hasMask}>
@@ -1577,6 +1670,10 @@ function SelectionPanel({
                 <button type="button" onClick={onUndo} disabled={!canUndo}><FiRotateCcw /> Undo</button>
                 <button type="button" onClick={onRedo} disabled={!canRedo}><FiRotateCw /> Redo</button>
             </div>
+
+            <button className="soft-action" type="button" onClick={() => onStartOver?.()} disabled={isDetecting || !onStartOver}>
+                <FiRotateCcw /> Start Over
+            </button>
 
             <strong className="field-heading">Zoom & Pan</strong>
             <div className="zoom-controls">
@@ -1622,6 +1719,7 @@ function CanvasEditor({
     setHasMask,
     setBackgroundRemoved,
     backgroundRemoved,
+    hasMask,
     detectionSource,
     setDetectionSource,
     setPreviewImages,
@@ -1630,8 +1728,15 @@ function CanvasEditor({
     const canvasRef = useRef(null);
     const imageCanvasRef = useRef(null);
     const originalImageDataRef = useRef(null);
+    const originalTrainingBlobRef = useRef(null);
+    const originalTrainingNameRef = useRef('');
     const backgroundCanvasRef = useRef(null);
     const maskRef = useRef(null);
+    const initialTrainingMaskRef = useRef(null);
+    const keepCorrectionRef = useRef(null);
+    const removeCorrectionRef = useRef(null);
+    const manualCorrectionCountRef = useRef(0);
+    const trainingExampleSavedRef = useRef(false);
     const historyRef = useRef([]);
     const redoRef = useRef([]);
     const isPaintingRef = useRef(false);
@@ -1643,6 +1748,7 @@ function CanvasEditor({
     const panDragRef = useRef(null);
     const manualPathRef = useRef([]);
     const brushPreviewPointRef = useRef(null);
+    const editingResultRef = useRef(false);
     const isDrawingPathRef = useRef(false);
     const autoDetectStartedRef = useRef(false);
     const [autoDetectNonce, setAutoDetectNonce] = useState(0);
@@ -1669,6 +1775,14 @@ function CanvasEditor({
         if (backgroundRemoved || editorMode === 'result') {
             fillCanvasBackground(context, canvas.width, canvas.height, activeBackground, backgroundCanvasRef.current);
             drawSubject(context, imageCanvas, mask);
+            return;
+        }
+
+        if (editorMode === 'mask' && editingResultRef.current && manualTool === 'brush') {
+            fillCanvasBackground(context, canvas.width, canvas.height, activeBackground, backgroundCanvasRef.current);
+            drawSubject(context, imageCanvas, mask);
+            drawRemovalEdges(context, mask);
+            drawBrushPreview(context, brushPreviewPointRef.current, brushSize, manualTool);
             return;
         }
 
@@ -1712,14 +1826,47 @@ function CanvasEditor({
         syncPreviews();
     }, [render, setHasMask, syncPreviews]);
 
+    const saveTrainingExample = useCallback(async () => {
+        if (trainingExampleSavedRef.current || manualCorrectionCountRef.current <= 0) return;
+        if (!originalTrainingBlobRef.current || !maskRef.current) return;
+
+        const fallbackInitialMask = initialTrainingMaskRef.current || createFullMask(maskRef.current.width, maskRef.current.height, 255);
+
+        try {
+            const result = await submitTrainingExample({
+                originalBlob: originalTrainingBlobRef.current,
+                originalName: originalTrainingNameRef.current,
+                initialMask: fallbackInitialMask,
+                correctedMask: maskRef.current,
+                keepCorrections: keepCorrectionRef.current,
+                removeCorrections: removeCorrectionRef.current,
+                source: initialTrainingMaskRef.current ? 'auto-detect' : 'manual-only',
+                metadata: {
+                    manual_corrections: manualCorrectionCountRef.current,
+                    width: maskRef.current.width,
+                    height: maskRef.current.height,
+                    detection_source: detectionSource || null,
+                },
+            });
+
+            trainingExampleSavedRef.current = true;
+            console.info('Compudia training example saved', result?.id);
+            setStatus('Background removed. Your correction was saved for future AI learning.');
+        } catch (error) {
+            console.warn('Could not save training example', error);
+        }
+    }, [detectionSource, setStatus]);
+
     const autoDetect = useCallback(async () => {
         if (!imageUrl || !canvasRef.current || isDetecting) return;
+
+        const shouldRefineCurrentResult = (backgroundRemoved || editorMode === 'result') && maskRef.current && !isEmptyMask(maskRef.current);
 
         setIsDetecting(true);
         setDetectProgress(0);
         setDetectionSource('');
         setDetectStage('Preparing AI detection...');
-        setStatus('Preparing automatic background detection...');
+        setStatus(shouldRefineCurrentResult ? 'Preparing automatic refinement...' : 'Preparing automatic background detection...');
 
         try {
             let maskBlob = null;
@@ -1778,12 +1925,19 @@ function CanvasEditor({
             setDetectProgress(90);
             setDetectStage(usedRembgServer ? 'Applying AI selection...' : 'Refining product edges...');
             setStatus(usedRembgServer ? 'Applying AI selection...' : 'Refining product edges...');
-            const mask = usedRembgServer
+            const detectedMask = usedRembgServer
                 ? repairWideContainerSurface(
                     repairLightProductInterior(sharpenMaskEdges(normalizeMask(rawMask)), originalImageDataRef.current),
                     originalImageDataRef.current,
                 )
                 : refineAutoDetectedMask(rawMask, originalImageDataRef.current);
+            const mask = applyManualCorrectionMemory(
+                shouldRefineCurrentResult
+                    ? mergeMasksForResultRefinement(maskRef.current, detectedMask)
+                    : detectedMask,
+                keepCorrectionRef.current,
+                removeCorrectionRef.current,
+            );
             if (isEmptyMask(mask)) {
                 throw new Error('Automatic detection returned an empty mask.');
             }
@@ -1791,17 +1945,25 @@ function CanvasEditor({
             setDetectStage('Applying selection...');
             setStatus('Applying selection...');
             pushHistory();
+            if (!shouldRefineCurrentResult) {
+                initialTrainingMaskRef.current = cloneImageData(mask);
+                manualCorrectionCountRef.current = 0;
+                trainingExampleSavedRef.current = false;
+            }
             setMask(mask);
-            setBackgroundRemoved(false);
+            editingResultRef.current = false;
+            setBackgroundRemoved(shouldRefineCurrentResult);
             setDetectionSource(usedRembgServer ? 'rembg' : usedLocalDetector ? 'local' : 'browser');
-            setEditorMode('auto');
+            setEditorMode(shouldRefineCurrentResult ? 'result' : 'auto');
             setDetectProgress(100);
             setDetectStage('Done');
-            setStatus(usedRembgServer
-                ? 'Automatic selection ready. If needed, refine manually, then remove the background.'
-                : shouldUseServerAi
-                    ? 'Browser fallback selection ready. Automatic AI service was not used.'
-                    : 'Portrait selection ready. If needed, refine manually, then remove the background.');
+            setStatus(shouldRefineCurrentResult
+                ? 'Current result refined. Use Manual Selection for final small fixes, or download the result.'
+                : usedRembgServer
+                    ? 'Automatic selection ready. If needed, refine manually, then remove the background.'
+                    : shouldUseServerAi
+                        ? 'Browser fallback selection ready. Automatic AI service was not used.'
+                        : 'Portrait selection ready. If needed, refine manually, then remove the background.');
         } catch (error) {
             console.error(error);
             setStatus('Auto Detect failed. Start the AI service, or use Select Manually.');
@@ -1810,27 +1972,32 @@ function CanvasEditor({
             setDetectProgress(0);
             setDetectStage('');
         }
-    }, [imageFile, imageUrl, isDetecting, pushHistory, setBackgroundRemoved, setDetectProgress, setDetectStage, setDetectionSource, setEditorMode, setIsDetecting, setMask, setStatus]);
+    }, [backgroundRemoved, editorMode, imageFile, imageUrl, isDetecting, pushHistory, setBackgroundRemoved, setDetectProgress, setDetectStage, setDetectionSource, setEditorMode, setIsDetecting, setMask, setStatus]);
 
     const removeBackground = useCallback(() => {
         if (!maskRef.current || isEmptyMask(maskRef.current)) {
             setStatus('Select the subject first with Auto Detect or Select Manually, then remove the background.');
             return;
         }
+        editingResultRef.current = false;
         setBackgroundRemoved(true);
         setEditorMode('result');
         setDetectionSource('');
         setStatus('Background removed. Choose a background or download the result.');
         render();
-    }, [render, setBackgroundRemoved, setDetectionSource, setEditorMode, setStatus]);
+        saveTrainingExample();
+    }, [render, saveTrainingExample, setBackgroundRemoved, setDetectionSource, setEditorMode, setStatus]);
 
     const startManualSelection = useCallback(() => {
         const canvas = canvasRef.current;
         if (!canvas) return;
 
-        const shouldKeepCurrentSelection = (backgroundRemoved || editorMode === 'result') && maskRef.current && !isEmptyMask(maskRef.current);
+        // Preserve an automatic mask when switching to manual refinement
+        // before the user renders the result.
+        const shouldKeepCurrentSelection = hasMask && maskRef.current && !isEmptyMask(maskRef.current);
 
         pushHistory();
+        editingResultRef.current = shouldKeepCurrentSelection;
         if (!shouldKeepCurrentSelection) {
             maskRef.current = createFullMask(canvas.width, canvas.height, 255);
             setHasMask(false);
@@ -1852,12 +2019,12 @@ function CanvasEditor({
         setDetectionSource('');
         setStatus(
             shouldKeepCurrentSelection
-                ? 'Manual refinement enabled. Brush over leftover background parts to remove them.'
+                ? 'Manual refinement enabled from the current result. Brush over leftover background parts to remove them.'
                 : 'Manual selection enabled. Drag over only the background area you want to remove.'
         );
         render();
         syncPreviews();
-    }, [backgroundRemoved, editorMode, pushHistory, render, setBackgroundRemoved, setDetectionSource, setEditorMode, setHasMask, setStatus, syncPreviews]);
+    }, [hasMask, pushHistory, render, setBackgroundRemoved, setDetectionSource, setEditorMode, setHasMask, setStatus, syncPreviews]);
 
     const restoreSelection = useCallback(() => {
         const canvas = canvasRef.current;
@@ -1868,6 +2035,7 @@ function CanvasEditor({
             setHasMask(false);
         }
 
+        editingResultRef.current = false;
         manualPathRef.current = [];
         brushPreviewPointRef.current = null;
         isPaintingRef.current = false;
@@ -1885,6 +2053,38 @@ function CanvasEditor({
         render();
         syncPreviews();
     }, [render, setBackgroundRemoved, setDetectionSource, setEditorMode, setHasMask, setStatus, syncPreviews]);
+
+    const startOver = useCallback(() => {
+        const canvas = canvasRef.current;
+        const imageCanvas = imageCanvasRef.current;
+        if (!canvas || !imageCanvas) return;
+
+        pushHistory();
+        maskRef.current = createFullMask(canvas.width, canvas.height, 255);
+        initialTrainingMaskRef.current = null;
+        keepCorrectionRef.current = createFullMask(canvas.width, canvas.height, 0);
+        removeCorrectionRef.current = createFullMask(canvas.width, canvas.height, 0);
+        manualCorrectionCountRef.current = 0;
+        trainingExampleSavedRef.current = false;
+        manualPathRef.current = [];
+        brushPreviewPointRef.current = null;
+        editingResultRef.current = false;
+        isPaintingRef.current = false;
+        isDrawingPathRef.current = false;
+        brushSampleRef.current = { r: 0, g: 0, b: 0, count: 0, colors: [] };
+        brushPointsRef.current = [];
+        brushStartPointRef.current = null;
+        brushMovedRef.current = false;
+        lastPointRef.current = null;
+        panDragRef.current = null;
+        setHasMask(false);
+        setBackgroundRemoved(false);
+        setDetectionSource('');
+        setEditorMode('original');
+        setStatus('Started over with the original image. Auto Detect or Select Manually when ready.');
+        render();
+        syncPreviews();
+    }, [pushHistory, render, setBackgroundRemoved, setDetectionSource, setEditorMode, setHasMask, setStatus, syncPreviews]);
 
     const undo = useCallback(() => {
         if (!historyRef.current.length || !maskRef.current) return;
@@ -1931,6 +2131,7 @@ function CanvasEditor({
             autoDetect,
             startManualSelection,
             restoreSelection,
+            startOver,
             removeBackground,
             undo,
             redo,
@@ -1938,7 +2139,7 @@ function CanvasEditor({
             canUndo: historyRef.current.length > 0,
             canRedo: redoRef.current.length > 0,
         });
-    }, [autoDetect, download, redo, registerActions, removeBackground, restoreSelection, startManualSelection, undo]);
+    }, [autoDetect, download, redo, registerActions, removeBackground, restoreSelection, startManualSelection, startOver, undo]);
 
     useEffect(() => {
         let cancelled = false;
@@ -1952,13 +2153,21 @@ function CanvasEditor({
             imageContext.drawImage(image, 0, 0);
             imageCanvasRef.current = imageCanvas;
             originalImageDataRef.current = imageContext.getImageData(0, 0, imageCanvas.width, imageCanvas.height);
+            originalTrainingBlobRef.current = imageFile || await canvasToBlob(imageCanvas, 'image/png');
+            originalTrainingNameRef.current = imageFile?.name || 'original.png';
 
             const canvas = canvasRef.current;
             canvas.width = image.naturalWidth;
             canvas.height = image.naturalHeight;
             maskRef.current = createFullMask(image.naturalWidth, image.naturalHeight, 255);
+            initialTrainingMaskRef.current = null;
+            keepCorrectionRef.current = createFullMask(image.naturalWidth, image.naturalHeight, 0);
+            removeCorrectionRef.current = createFullMask(image.naturalWidth, image.naturalHeight, 0);
+            manualCorrectionCountRef.current = 0;
+            trainingExampleSavedRef.current = false;
             manualPathRef.current = [];
             brushPreviewPointRef.current = null;
+            editingResultRef.current = false;
             historyRef.current = [];
             redoRef.current = [];
             autoDetectStartedRef.current = false;
@@ -2067,8 +2276,22 @@ function CanvasEditor({
                 hardness,
                 paintMode,
             );
+
+            const keepCorrections = keepCorrectionRef.current;
+            const removeCorrections = removeCorrectionRef.current;
+            if (keepCorrections && removeCorrections) {
+                if (paintMode === 'keep') {
+                    paintMask(keepCorrections, x, y, brushSize, hardness, 'keep');
+                    paintMask(removeCorrections, x, y, brushSize, hardness, 'remove');
+                } else {
+                    paintMask(removeCorrections, x, y, brushSize, hardness, 'keep');
+                    paintMask(keepCorrections, x, y, brushSize, hardness, 'remove');
+                }
+            }
         }
 
+        manualCorrectionCountRef.current += 1;
+        trainingExampleSavedRef.current = false;
         lastPointRef.current = point;
         setHasMask(!isEmptyMask(mask));
         setBackgroundRemoved(false);
@@ -2193,6 +2416,11 @@ function CanvasEditor({
                                 ? path
                                 : [...path, first];
                             maskRef.current = fillMaskPath(maskRef.current, closedPath, 'keep');
+                            if (keepCorrectionRef.current) {
+                                keepCorrectionRef.current = fillMaskPath(keepCorrectionRef.current, closedPath, 'keep');
+                            }
+                            manualCorrectionCountRef.current += 1;
+                            trainingExampleSavedRef.current = false;
                             setHasMask(!isEmptyMask(maskRef.current));
                             setBackgroundRemoved(false);
                             setEditorMode('mask');
@@ -2395,6 +2623,7 @@ function Editor({
                         setStatus('Unselect Path enabled.');
                     }}
                     onRemoveBackground={actions.removeBackground}
+                    onStartOver={actions.startOver}
                     isDetecting={isDetecting}
                     hasMask={hasMask}
                     backgroundRemoved={backgroundRemoved}
@@ -2423,6 +2652,7 @@ function Editor({
                     setHasMask={setHasMask}
                     setBackgroundRemoved={setBackgroundRemoved}
                     backgroundRemoved={backgroundRemoved}
+                    hasMask={hasMask}
                     detectionSource={detectionSource}
                     setDetectionSource={setDetectionSource}
                     setPreviewImages={setPreviewImages}
