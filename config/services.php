@@ -23,8 +23,9 @@ return [
     ],
 
     'background_ai' => [
+        'enabled' => (bool) env('BACKGROUND_AI_ENABLED', false),
         'url' => env('BACKGROUND_AI_URL', 'http://127.0.0.1:8010'),
-        'timeout' => (int) env('BACKGROUND_AI_TIMEOUT', 180),
+        'timeout' => (int) env('BACKGROUND_AI_TIMEOUT', 8),
     ],
 
     'ses' => [

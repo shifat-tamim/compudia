@@ -430,24 +430,31 @@ function getCsrfToken() {
     return document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') || '';
 }
 
-async function requestRembgBackgroundRemoval(imageFile) {
+async function requestRembgBackgroundRemoval(imageFile, timeoutMs = 8000) {
     const formData = new FormData();
     formData.append('image', imageFile);
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
 
-    const response = await fetch('/remove-background/rembg', {
-        method: 'POST',
-        body: formData,
-        headers: {
-            Accept: 'image/png',
-            'X-CSRF-TOKEN': getCsrfToken(),
-        },
-    });
+    try {
+        const response = await fetch('/remove-background/rembg', {
+            method: 'POST',
+            body: formData,
+            signal: controller.signal,
+            headers: {
+                Accept: 'image/png',
+                'X-CSRF-TOKEN': getCsrfToken(),
+            },
+        });
 
-    if (!response.ok) {
-        throw new Error(`AI background detection failed with status ${response.status}`);
+        if (!response.ok) {
+            throw new Error(`AI background detection failed with status ${response.status}`);
+        }
+
+        return response.blob();
+    } finally {
+        window.clearTimeout(timeout);
     }
-
-    return response.blob();
 }
 
 async function submitTrainingExample({

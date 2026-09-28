@@ -21,6 +21,10 @@ class BackgroundRemovalController extends Controller
         $image = $validated['image'];
         $imageBytes = file_get_contents($image->getRealPath());
 
+        if (! config('services.background_ai.enabled')) {
+            abort(503, 'Compudia rembg service is disabled.');
+        }
+
         $rembgServiceUrl = rtrim((string) config('services.background_ai.url'), '/');
 
         if (! $rembgServiceUrl) {
